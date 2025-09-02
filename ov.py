@@ -6,20 +6,66 @@ from PyQt5.QtWidgets import (QApplication, QWidget, QLabel, QVBoxLayout, QPushBu
                              QHBoxLayout, QScrollArea, QFrame, QDialog, QFormLayout, 
                              QLineEdit, QComboBox, QDialogButtonBox, QListWidget, 
                              QListWidgetItem, QAbstractItemView, QSizePolicy, QShortcut,
-                             QTabWidget)
-from PyQt5.QtCore import Qt, QTimer, QPoint, QSize, QPropertyAnimation, QEasingCurve, pyqtSignal
+                             QTabWidget, QMessageBox, QStyle)
+from PyQt5.QtCore import Qt, QTimer, QPoint, QSize, QPropertyAnimation, QEasingCurve, pyqtSignal, QObject
 from PyQt5.QtGui import QCursor, QPixmap, QKeySequence
 import pyperclip
 import threading
 import json
 from urllib.parse import urlencode
 import os
+import socket
+
+def resource_path(relative_path):
+    """Ottieni il percorso assoluto per le risorse, funziona sia in dev che in .exe"""
+    try:
+        # PyInstaller crea una cartella temporanea e memorizza il percorso in _MEIPASS
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
 
 # Ignora tutti i warning di deprecazione
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 BACKEND_URL = "https://wmsniper.onrender.com"
 CHECK_INTERVAL = 5  # secondi
+
+def get_local_ip():
+    """Ottieni l'IP locale della macchina"""
+    try:
+        # Connessione temporanea per ottenere l'IP locale
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+        return local_ip
+    except Exception:
+        # Fallback: prova con hostname
+        try:
+            return socket.gethostbyname(socket.gethostname())
+        except Exception:
+            return "127.0.0.1"  # Ultimo fallback
+
+# Worker semplice per eseguire richieste HTTP fuori dal thread UI
+class HttpWorker(QObject):
+    success = pyqtSignal(object)
+    error = pyqtSignal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._thread = None
+
+    def run(self, func):
+        def _target():
+            try:
+                result = func()
+                self.success.emit(result)
+            except Exception as e:
+                self.error.emit(e)
+        t = threading.Thread(target=_target, daemon=True)
+        self._thread = t
+        t.start()
+
 
 def to_item_url(display_name: str) -> str:
     # Same normalization used by the backend
@@ -38,8 +84,9 @@ class ToggleIcon(QLabel):
         self.setAttribute(Qt.WA_TranslucentBackground)
         
         # Carica l'icona o usa un placeholder
-        if os.path.exists("icon.jpg"):
-            self.setPixmap(QPixmap("icon.jpg").scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        icon_path = resource_path("icon.jpg")
+        if os.path.exists(icon_path):
+            self.setPixmap(QPixmap(icon_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
             self.setStyleSheet("""
                 background-color: #3498db;
@@ -188,33 +235,40 @@ class OfferWidget(QFrame):
             
     def stop_search(self):
         item_url = self.offer.get('item')
-        try:
+        headers = {'X-User-ID': self.overlay.user_id} if self.overlay.user_id else {}
+        self._stop_worker = HttpWorker(self)
+        def _task():
             # 1. Ferma la ricerca
             response = requests.post(
                 f"{BACKEND_URL}/stop_watch",
                 data={'item_url': item_url},
+                headers=headers,
                 timeout=5
             )
-            if response.status_code == 200:
-                print(f"Ricerca fermata per: {item_url}")
-                
-                # 2. Rimuovi le offerte dal backend
-                clear_response = requests.post(
-                    f"{BACKEND_URL}/clear_matches",
-                    data={'item_url': item_url},
-                    timeout=5
-                )
-                if clear_response.status_code == 200:
-                    print(f"Offerte rimosse per: {item_url}")
+            if response.status_code != 200:
+                raise Exception(f"Search Stop Error: {response.text}")
+            # 2. Rimuovi le offerte dal backend
+            clear_response = requests.post(
+                f"{BACKEND_URL}/clear_matches",
+                data={'item_url': item_url},
+                headers=headers,
+                timeout=5
+            )
+            return (response.status_code, clear_response.status_code, clear_response.text, item_url)
+        def _on_success(result):
+            stop_code, clear_code, clear_text, it = result
+            if stop_code == 200:
+                print(f"Ricerca fermata per: {it}")
+                if clear_code == 200:
+                    print(f"Offerte rimosse per: {it}")
                 else:
-                    print("Offer Removal Error:", clear_response.text)
-                
-                # 3. Rimuovi tutti i widget per questo item (client-side) e sopprimi temporaneamente
-                self.overlay.remove_item_widgets(item_url)
-            else:
-                print("Search Stop Error:", response.text)
-        except Exception as e:
+                    print("Offer Removal Error:", clear_text)
+                self.overlay.remove_item_widgets(it)
+        def _on_error(e):
             print("Stop search request error:", e)
+        self._stop_worker.success.connect(_on_success)
+        self._stop_worker.error.connect(_on_error)
+        self._stop_worker.run(_task)
 
 class ManualOfferWidget(QFrame):
     def __init__(self, offer, parent=None):
@@ -376,19 +430,21 @@ class ManualSearchDialog(QDialog):
             self.autocomplete_list.setVisible(False)
             return
             
-        try:
-            params = {'q': query, 'limit': 10}
-            response = requests.get(f"{BACKEND_URL}/autocomplete?{urlencode(params)}", timeout=5)
-            if response.status_code == 200:
-                items = response.json()
-                self.update_autocomplete_list(items)
-            else:
-                self.autocomplete_list.clear()
-                self.autocomplete_list.setVisible(False)
-        except Exception as e:
+        params = {'q': query, 'limit': 10}
+        url = f"{BACKEND_URL}/autocomplete?{urlencode(params)}"
+        self._autocomplete_worker = HttpWorker(self)
+        def _task():
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
+                raise Exception(f"Status {resp.status_code}")
+            return resp.json()
+        self._autocomplete_worker.success.connect(lambda items: self.update_autocomplete_list(items))
+        def _on_err(e):
             print("Error autocomplete:", e)
             self.autocomplete_list.clear()
             self.autocomplete_list.setVisible(False)
+        self._autocomplete_worker.error.connect(_on_err)
+        self._autocomplete_worker.run(_task)
             
     def update_autocomplete_list(self, items):
         self.autocomplete_list.clear()
@@ -540,19 +596,21 @@ class SearchDialog(QDialog):
             self.autocomplete_list.setVisible(False)
             return
             
-        try:
-            params = {'q': query, 'limit': 10}
-            response = requests.get(f"{BACKEND_URL}/autocomplete?{urlencode(params)}", timeout=5)
-            if response.status_code == 200:
-                items = response.json()
-                self.update_autocomplete_list(items)
-            else:
-                self.autocomplete_list.clear()
-                self.autocomplete_list.setVisible(False)
-        except Exception as e:
+        params = {'q': query, 'limit': 10}
+        url = f"{BACKEND_URL}/autocomplete?{urlencode(params)}"
+        self._autocomplete_worker = HttpWorker(self)
+        def _task():
+            resp = requests.get(url, timeout=5)
+            if resp.status_code != 200:
+                raise Exception(f"Status {resp.status_code}")
+            return resp.json()
+        self._autocomplete_worker.success.connect(lambda items: self.update_autocomplete_list(items))
+        def _on_err(e):
             print("Error autocomplete:", e)
             self.autocomplete_list.clear()
             self.autocomplete_list.setVisible(False)
+        self._autocomplete_worker.error.connect(_on_err)
+        self._autocomplete_worker.run(_task)
             
     def update_autocomplete_list(self, items):
         self.autocomplete_list.clear()
@@ -621,8 +679,9 @@ class SearchDialog(QDialog):
         }
 
 class ManualSearchTab(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, user_id, parent=None):
         super().__init__(parent)
+        self.user_id = user_id
         self.current_item = None
         self.current_rank = "All"
         self.displayed_offers = {}
@@ -676,46 +735,42 @@ class ManualSearchTab(QWidget):
     def refresh_offers(self):
         if not self.current_item:
             return
-            
+        
         item_url = to_item_url(self.current_item)
         
         # Se l'item è stato stoppato, non aggiornare
         if item_url in self.stopped_items:
             return
-            
-        try:
-            # Prepara i parametri della richiesta
-            params = {
-                'item_url': item_url,
-                'rank': self.current_rank.lower(),
-                'limit': 10  # Limita a 10 offerte
-            }
-            
-            # Aggiungi max_rank_override se specificato e se il rank è Maxed
-            if self.current_rank == "Maxed" and self.max_rank_override.strip():
-                params['max_rank_override'] = self.max_rank_override.strip()
-            
-            # Aggiungi filtri preimpostati
-            filters = {
-                'seller_status': 'ingame',
-                'online_only': 'true'
-            }
-            
-            # Effettua la richiesta al backend
-            response = requests.get(
+        
+        # Prepara i parametri della richiesta
+        params = {
+            'item_url': item_url,
+            'rank': self.current_rank.lower(),
+            'limit': 10  # Limita a 10 offerte
+        }
+        # Aggiungi max_rank_override se specificato e se il rank è Maxed
+        if self.current_rank == "Maxed" and self.max_rank_override.strip():
+            params['max_rank_override'] = self.max_rank_override.strip()
+        # Aggiungi filtri preimpostati
+        filters = {
+            'seller_status': 'ingame',
+            'online_only': 'true'
+        }
+        headers = {'X-User-ID': self.user_id} if self.user_id else {}
+        self._offers_worker = HttpWorker(self)
+        def _task():
+            resp = requests.get(
                 f"{BACKEND_URL}/manual_offers",
                 params={**params, **filters},
+                headers=headers,
                 timeout=10
             )
-            
-            if response.status_code == 200:
-                offers = response.json()
-                self.display_offers(offers)
-            else:
-                self.info_label.setText(f"Search Error: {response.status_code}")
-                
-        except Exception as e:
-            self.info_label.setText(f"Connection Error: {str(e)}")
+            if resp.status_code != 200:
+                raise Exception(f"Search Error: {resp.status_code}")
+            return resp.json()
+        self._offers_worker.success.connect(lambda offers: self.display_offers(offers))
+        self._offers_worker.error.connect(lambda e: self.info_label.setText(f"Connection Error: {str(e)}"))
+        self._offers_worker.run(_task)
     
     def display_offers(self, offers):
         # Pulisci i risultati precedenti
@@ -746,8 +801,9 @@ class ManualSearchTab(QWidget):
             self.displayed_offers[item_url].append(widget)
 
 class Overlay(QWidget):
-    def __init__(self):
+    def __init__(self, user_id):
         super().__init__()
+        self.user_id = user_id
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint |
             Qt.FramelessWindowHint |
@@ -780,24 +836,27 @@ class Overlay(QWidget):
         self.new_search_btn.clicked.connect(self.open_search_dialog)
         top_bar.addWidget(self.new_search_btn)
         
-        # Pulsante per chiudere l'overlay
-        self.close_btn = QPushButton("✕")
-        self.close_btn.setStyleSheet("""
+        # Pulsante Chiudi Applicazione
+        self.close_app_button = QPushButton("✕")
+        self.close_app_button.setToolTip("Close")
+        self.close_app_button.setStyleSheet("""
             QPushButton {
-                background-color: #e74c3c; 
-                color: white; 
+                background-color: #e74c3c;
+                color: white;
                 font-weight: bold;
-                padding: 5px;
+                font-size: 12px;
                 border-radius: 3px;
                 min-width: 24px;
                 max-width: 24px;
+                min-height: 24px;
+                max-height: 24px;
             }
             QPushButton:hover {
                 background-color: #c0392b;
             }
         """)
-        self.close_btn.clicked.connect(self.hide_overlay)
-        top_bar.addWidget(self.close_btn)
+        self.close_app_button.clicked.connect(QApplication.instance().quit)
+        top_bar.addWidget(self.close_app_button)
         
         main_layout.addLayout(top_bar)
         
@@ -841,7 +900,7 @@ class Overlay(QWidget):
         self.sniper_tab.setLayout(sniper_layout)
         
         # Tab Ricerca Manuale
-        self.manual_tab = ManualSearchTab()
+        self.manual_tab = ManualSearchTab(self.user_id)
         
         # Aggiungi i tab
         self.tabs.addTab(self.sniper_tab, "Sniper")
@@ -916,11 +975,13 @@ class Overlay(QWidget):
                 pass
 
     def check_notifications(self):
-        try:
-            response = requests.get(f"{BACKEND_URL}/matches", timeout=5)
-            response.raise_for_status()
-            matches = response.json()
-
+        headers = {'X-User-ID': self.user_id} if self.user_id else {}
+        self._matches_worker = HttpWorker(self)
+        def _task():
+            resp = requests.get(f"{BACKEND_URL}/matches", headers=headers, timeout=5)
+            resp.raise_for_status()
+            return resp.json()
+        def _on_success(matches):
             # Costruisci set di msg_id attuali riportati dal backend
             current_msg_ids = set()
             for m in matches:
@@ -949,9 +1010,11 @@ class Overlay(QWidget):
                 if item_url not in self.offers_by_item:
                     self.offers_by_item[item_url] = []
                 self.offers_by_item[item_url].append(offer_widget)
-
-        except Exception as e:
+        def _on_error(e):
             print("Overlay error:", e)
+        self._matches_worker.success.connect(_on_success)
+        self._matches_worker.error.connect(_on_error)
+        self._matches_worker.run(_task)
             
     def open_search_dialog(self):
         # Apre la dialog in base alla tab selezionata
@@ -961,14 +1024,19 @@ class Overlay(QWidget):
                 data = dialog.get_data()
                 if not data['item']:
                     return
-                    
-                try:
-                    response = requests.post(
+                headers = {'X-User-ID': self.user_id} if self.user_id else {}
+                self._start_worker = HttpWorker(self)
+                def _task():
+                    resp = requests.post(
                         f"{BACKEND_URL}/start_watch",
                         data=data,
+                        headers=headers,
                         timeout=5
                     )
-                    if response.status_code == 200:
+                    return (resp.status_code, resp.text)
+                def _on_success(result):
+                    status_code, text = result
+                    if status_code == 200:
                         print(f"Ricerca avviata per: {data['item']}")
                         # Calcola item_url dalla display name (stesso comportamento del backend)
                         item_url = to_item_url(data['item'])
@@ -979,13 +1047,15 @@ class Overlay(QWidget):
                                 self.suppressed_items.remove(sid)
                             except KeyError:
                                 pass
-
                         # Forza un refresh immediato
                         self.check_notifications()
                     else:
-                        print("Error starting Search:", response.text)
-                except Exception as e:
+                        print("Error starting Search:", text)
+                def _on_error(e):
                     print("Search Request Error:", e)
+                self._start_worker.success.connect(_on_success)
+                self._start_worker.error.connect(_on_error)
+                self._start_worker.run(_task)
         else:  # Tab Warframe Market
             dialog = ManualSearchDialog(self)
             if dialog.exec_() == QDialog.Accepted:
@@ -1044,12 +1114,17 @@ class Overlay(QWidget):
         """Nasconde l'overlay"""
         self.hide()
 
+
 class OverlaySystem:
     def __init__(self):
         self.app = QApplication(sys.argv)
         
+        # Usa automaticamente l'IP locale come user_id
+        local_ip = get_local_ip()
+        print(f"Using local IP as user ID: {local_ip}")
+        
         # Crea l'overlay principale
-        self.overlay = Overlay()
+        self.overlay = Overlay(local_ip)
         
         # Crea l'icona di toggle
         self.toggle_icon = ToggleIcon(self.overlay)
@@ -1059,13 +1134,10 @@ class OverlaySystem:
         self.toggle_icon.move(screen_geom.right() - 50, 20)
         self.toggle_icon.show()
         
-        # Imposta la scorciatoia da tastiera (tasto Ins) sull'icona
-        self.toggle_shortcut = QShortcut(QKeySequence(Qt.Key_Insert), self.toggle_icon)
-        self.toggle_shortcut.activated.connect(self.toggle_system)
-        
         # Stato iniziale
         self.system_visible = True
         self.overlay_was_visible = False
+
         
     def toggle_system(self):
         """Attiva/disattiva l'intero sistema (icona + overlay)"""
