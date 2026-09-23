@@ -14,7 +14,7 @@ import threading
 import json
 from urllib.parse import urlencode
 import os
-import socket
+import uuid
 
 def resource_path(relative_path):
     """Ottieni il percorso assoluto per le risorse, funziona sia in dev che in .exe"""
@@ -31,20 +31,27 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 BACKEND_URL = "https://wmsniper.onrender.com"
 CHECK_INTERVAL = 5  # secondi
 
-def get_local_ip():
-    """Ottieni l'IP locale della macchina"""
+def get_persistent_user_id():
+    """Restituisce un UUID stabile, nel formato richiesto dal backend."""
+    app_data_dir = os.environ.get("APPDATA") or os.path.expanduser("~")
+    user_id_path = os.path.join(app_data_dir, "WM-Sniper", "user_id.txt")
+
     try:
-        # Connessione temporanea per ottenere l'IP locale
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            local_ip = s.getsockname()[0]
-        return local_ip
-    except Exception:
-        # Fallback: prova con hostname
-        try:
-            return socket.gethostbyname(socket.gethostname())
-        except Exception:
-            return "127.0.0.1"  # Ultimo fallback
+        with open(user_id_path, "r", encoding="utf-8") as user_id_file:
+            saved_user_id = user_id_file.read().strip()
+        return str(uuid.UUID(saved_user_id))
+    except (OSError, ValueError, AttributeError):
+        pass
+
+    user_id = str(uuid.uuid4())
+    try:
+        os.makedirs(os.path.dirname(user_id_path), exist_ok=True)
+        with open(user_id_path, "w", encoding="utf-8") as user_id_file:
+            user_id_file.write(user_id)
+    except OSError:
+        # Anche senza poter salvare il file, l'UUID resta valido per questa sessione.
+        pass
+    return user_id
 
 # Worker semplice per eseguire richieste HTTP fuori dal thread UI
 class HttpWorker(QObject):
@@ -75,23 +82,25 @@ class ToggleIcon(QLabel):
     def __init__(self, overlay_window, parent=None):
         super().__init__(parent)
         self.overlay = overlay_window
-        self.setFixedSize(32, 32)
+        self.setFixedSize(38, 38)
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint |
             Qt.FramelessWindowHint |
             Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setToolTip("WM Sniper — double-click to show or hide")
         
         # Carica l'icona o usa un placeholder
         icon_path = resource_path("icon.jpg")
         if os.path.exists(icon_path):
-            self.setPixmap(QPixmap(icon_path).scaled(32, 32, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+            self.setPixmap(QPixmap(icon_path).scaled(34, 34, Qt.KeepAspectRatio, Qt.SmoothTransformation))
         else:
             self.setStyleSheet("""
-                background-color: #3498db;
-                border-radius: 16px;
-                border: 2px solid #2980b9;
+                background-color: #111b27;
+                border-radius: 19px;
+                border: 2px solid #e6c676;
+                color: #e6c676;
             """)
             self.setText("⚙️")
             self.setAlignment(Qt.AlignCenter)
@@ -122,14 +131,18 @@ class OfferWidget(QFrame):
         self.offer = offer
         self.overlay = overlay_instance
         self.setStyleSheet("""
-            QFrame { 
-                background-color: rgba(0,0,0,150); 
-                border-radius: 5px; 
-                margin: 2px;
+            QFrame {
+                background-color: rgba(7,13,20,220);
+                border: 1px solid rgba(126,230,231,55);
+                border-left: 3px solid #7ee6e7;
+                border-radius: 7px;
+                margin: 3px 1px;
             }
-            QLabel { 
-                color: white; 
-                font-size: 9pt;
+            QFrame:hover { background-color: rgba(21,43,52,235); border-color: rgba(126,230,231,135); }
+            QLabel {
+                color: #edf5f5;
+                font-size: 10pt;
+                font-weight: 600;
             }
             QPushButton { 
                 color: white; 
@@ -139,8 +152,9 @@ class OfferWidget(QFrame):
                 font-size: 9pt;
             }
             #copyButton {
-                background-color: #4CAF50; 
-                min-width: 50px;
+                background-color: #69d6a1;
+                color: #07120e;
+                min-width: 54px;
             }
             #copyButton:hover {
                 background-color: #45a049; 
@@ -153,14 +167,16 @@ class OfferWidget(QFrame):
                 background-color: #c0392b;
             }
             #removeButton {
-                background-color: #95a5a6;
+                background-color: rgba(156,171,183,35);
+                border: 1px solid rgba(156,171,183,100);
                 min-width: 60px;
             }
             #removeButton:hover {
                 background-color: #7f8c8d;
             }
             #stopButton {
-                background-color: #e67e22;
+                background-color: #e6c676;
+                color: #151006;
                 min-width: 50px;
             }
             #stopButton:hover {
@@ -173,7 +189,7 @@ class OfferWidget(QFrame):
         # Etichetta principale con testo ridotto
         main_text = f"{offer.get('display_name')} - {offer.get('price')}p"
         self.label = QLabel(main_text)
-        self.label.setToolTip(f"Venditore: {offer.get('seller')}")
+        self.label.setToolTip(f"Seller: {offer.get('seller')}")
         layout.addWidget(self.label, 1)
         
         # Contenitore per i pulsanti
@@ -185,19 +201,19 @@ class OfferWidget(QFrame):
         # Pulsanti con dimensioni ottimizzate
         copy_btn = QPushButton("Copy")
         copy_btn.setObjectName("copyButton")
-        copy_btn.setToolTip("Copia messaggio per il venditore")
+        copy_btn.setToolTip("Copy message to seller")
         copy_btn.clicked.connect(self.copy_message)
         btn_layout.addWidget(copy_btn)
 
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("removeButton")
-        remove_btn.setToolTip("Rimuovi questa offerta")
+        remove_btn.setToolTip("Remove this offer")
         remove_btn.clicked.connect(self.remove_self)
         btn_layout.addWidget(remove_btn)
         
         stop_btn = QPushButton("Stop")
         stop_btn.setObjectName("stopButton")
-        stop_btn.setToolTip("Ferma ricerca per questo item")
+        stop_btn.setToolTip("Stop watching this item")
         stop_btn.clicked.connect(self.stop_search)
         btn_layout.addWidget(stop_btn)
         
@@ -277,14 +293,18 @@ class ManualOfferWidget(QFrame):
         self.parent_tab = parent
         
         self.setStyleSheet("""
-            QFrame { 
-                background-color: rgba(0,0,0,150); 
-                border-radius: 5px; 
-                margin: 2px;
+            QFrame {
+                background-color: rgba(7,13,20,220);
+                border: 1px solid rgba(126,230,231,55);
+                border-left: 3px solid #e6c676;
+                border-radius: 7px;
+                margin: 3px 1px;
             }
-            QLabel { 
-                color: white; 
-                font-size: 9pt;
+            QFrame:hover { background-color: rgba(32,37,37,235); border-color: rgba(230,198,118,135); }
+            QLabel {
+                color: #edf5f5;
+                font-size: 10pt;
+                font-weight: 600;
             }
             QPushButton { 
                 color: white; 
@@ -294,14 +314,16 @@ class ManualOfferWidget(QFrame):
                 font-size: 9pt;
             }
             #copyButton {
-                background-color: #4CAF50; 
-                min-width: 50px;
+                background-color: #69d6a1;
+                color: #07120e;
+                min-width: 54px;
             }
             #copyButton:hover {
                 background-color: #45a049; 
             }
             #removeButton {
-                background-color: #95a5a6;
+                background-color: rgba(156,171,183,35);
+                border: 1px solid rgba(156,171,183,100);
                 min-width: 60px;
             }
             #removeButton:hover {
@@ -314,7 +336,7 @@ class ManualOfferWidget(QFrame):
         # Etichetta principale
         main_text = f"{offer.get('display_name')} - {offer.get('price')}p"
         self.label = QLabel(main_text)
-        self.label.setToolTip(f"Venditore: {offer.get('seller')}")
+        self.label.setToolTip(f"Seller: {offer.get('seller')}")
         layout.addWidget(self.label, 1)
         
         # Contenitore per i pulsanti
@@ -326,13 +348,13 @@ class ManualOfferWidget(QFrame):
         # Pulsanti
         copy_btn = QPushButton("Copy")
         copy_btn.setObjectName("copyButton")
-        copy_btn.setToolTip("Copia messaggio per il venditore")
+        copy_btn.setToolTip("Copy message to seller")
         copy_btn.clicked.connect(self.copy_message)
         btn_layout.addWidget(copy_btn)
 
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("removeButton")
-        remove_btn.setToolTip("Rimuovi questa offerta")
+        remove_btn.setToolTip("Remove this offer")
         remove_btn.clicked.connect(self.remove_self)
         btn_layout.addWidget(remove_btn)
         
@@ -356,6 +378,14 @@ class ManualSearchDialog(QDialog):
         self.setWindowTitle("WM Search")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setFixedSize(550, 400)
+        self.setStyleSheet("""
+            QDialog { background: #0d141e; color: #edf5f5; }
+            QLabel { color: #ccd7d8; font-weight: 600; }
+            QLineEdit, QComboBox { min-height: 34px; padding: 0 9px; color: #edf5f5; background: #070b12; border: 1px solid rgba(167,200,221,55); border-radius: 4px; }
+            QLineEdit:focus, QComboBox:focus { border-color: #7ee6e7; }
+            QPushButton { min-height: 34px; padding: 0 14px; border: 1px solid #e6c676; border-radius: 4px; color: #11120f; font-weight: 700; background: #e6c676; }
+            QPushButton:hover { background: #ffe4a0; }
+        """)
         layout = QVBoxLayout()
         
         form = QFormLayout()
@@ -517,6 +547,14 @@ class SearchDialog(QDialog):
         self.setWindowTitle("WM Sniper")
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowContextHelpButtonHint)
         self.setFixedSize(550, 400)  # Aumentato per più spazio
+        self.setStyleSheet("""
+            QDialog { background: #0d141e; color: #edf5f5; }
+            QLabel { color: #ccd7d8; font-weight: 600; }
+            QLineEdit, QComboBox { min-height: 34px; padding: 0 9px; color: #edf5f5; background: #070b12; border: 1px solid rgba(167,200,221,55); border-radius: 4px; }
+            QLineEdit:focus, QComboBox:focus { border-color: #7ee6e7; }
+            QPushButton { min-height: 34px; padding: 0 14px; border: 1px solid #e6c676; border-radius: 4px; color: #11120f; font-weight: 700; background: #e6c676; }
+            QPushButton:hover { background: #ffe4a0; }
+        """)
         layout = QVBoxLayout()
         
         form = QFormLayout()
@@ -691,7 +729,7 @@ class ManualSearchTab(QWidget):
         layout.setContentsMargins(5, 5, 5, 5)
         
         # Etichetta informazioni
-        self.info_label = QLabel("Use the search button above to find items")
+        self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: white; font-size: 10pt; padding: 5px;")
         self.info_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.info_label)
@@ -804,45 +842,71 @@ class Overlay(QWidget):
     def __init__(self, user_id):
         super().__init__()
         self.user_id = user_id
+        self.setObjectName("overlayRoot")
         self.setWindowFlags(
             Qt.WindowStaysOnTopHint |
             Qt.FramelessWindowHint |
             Qt.Tool
         )
         self.setAttribute(Qt.WA_TranslucentBackground)
-        self.setFixedSize(500, 350)  # Dimensioni aumentate per la nuova UI
+        self.setFixedSize(540, 390)
+        self.setStyleSheet("""
+            QWidget#overlayRoot { background: #0d141e; border: 1px solid rgba(126,230,231,110); border-radius: 12px; }
+            QLabel#brand { color: #edf5f5; font-size: 14pt; font-weight: 800; letter-spacing: 1px; }
+            QLabel#brandAccent { color: #e6c676; }
+            QLabel#connectionStatus { color: #9cabb7; font-size: 8pt; font-weight: 600; }
+            QLabel#connectionDot { color: #69d6a1; font-size: 12pt; }
+            QScrollArea { border: none; background: transparent; }
+            QScrollBar:vertical { width: 8px; background: transparent; }
+            QScrollBar::handle:vertical { min-height: 24px; border-radius: 4px; background: rgba(126,230,231,100); }
+            QTabWidget::pane { border: 1px solid rgba(167,200,221,40); border-radius: 8px; background: rgba(7,11,18,185); }
+            QTabBar::tab { min-width: 128px; padding: 8px 13px; color: #9cabb7; background: rgba(17,27,39,180); border: 1px solid transparent; border-bottom: 2px solid transparent; font-weight: 700; }
+            QTabBar::tab:selected { color: #edf5f5; border-bottom-color: #e6c676; background: rgba(30,48,61,210); }
+            QTabBar::tab:hover:!selected { color: #7ee6e7; }
+        """)
 
         self.drag_position = None
         self.offers_by_item = {}  # Tieni traccia degli widget per item
 
         main_layout = QVBoxLayout()
-        main_layout.setContentsMargins(5, 5, 5, 5)
+        main_layout.setContentsMargins(14, 12, 14, 14)
+        main_layout.setSpacing(10)
         
-        # Barra superiore con pulsante nuova ricerca
+        # Barra superiore: identità del prodotto, stato e azione principale.
         top_bar = QHBoxLayout()
-        self.new_search_btn = QPushButton("WM Sniper")
+        top_bar.setSpacing(8)
+        brand = QLabel("WM <span style='color:#e6c676'>SNIPER</span>")
+        brand.setObjectName("brand")
+        top_bar.addWidget(brand)
+        top_bar.addSpacing(10)
+        self.new_search_btn = QPushButton("Create Sniper Watch")
+        self.new_search_btn.setMinimumWidth(270)
+        self.new_search_btn.setToolTip("Create a new search in the current tab")
         self.new_search_btn.setStyleSheet("""
             QPushButton {
-                background-color: #3498db; 
-                color: white; 
-                font-weight: bold;
-                padding: 5px;
-                border-radius: 3px;
+                background-color: #e6c676;
+                color: #11120f;
+                border: 1px solid #ffe4a0;
+                font-weight: 800;
+                padding: 7px 12px;
+                border-radius: 4px;
             }
             QPushButton:hover {
-                background-color: #2980b9;
+                background-color: #ffe4a0;
             }
         """)
         self.new_search_btn.clicked.connect(self.open_search_dialog)
         top_bar.addWidget(self.new_search_btn)
+        top_bar.addStretch(1)
         
         # Pulsante Chiudi Applicazione
         self.close_app_button = QPushButton("✕")
         self.close_app_button.setToolTip("Close")
         self.close_app_button.setStyleSheet("""
             QPushButton {
-                background-color: #e74c3c;
-                color: white;
+                background-color: transparent;
+                border: 1px solid rgba(239,115,120,130);
+                color: #ef7378;
                 font-weight: bold;
                 font-size: 12px;
                 border-radius: 3px;
@@ -852,7 +916,7 @@ class Overlay(QWidget):
                 max-height: 24px;
             }
             QPushButton:hover {
-                background-color: #c0392b;
+                background-color: rgba(239,115,120,35);
             }
         """)
         self.close_app_button.clicked.connect(QApplication.instance().quit)
@@ -862,23 +926,6 @@ class Overlay(QWidget):
         
         # Sistema a tab
         self.tabs = QTabWidget()
-        self.tabs.setStyleSheet("""
-            QTabWidget::pane {
-                border: 1px solid #444;
-                background: rgba(30, 30, 30, 200);
-            }
-            QTabBar::tab {
-                background: rgba(50, 50, 50, 200);
-                color: white;
-                padding: 8px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-            }
-            QTabBar::tab:selected {
-                background: rgba(70, 70, 70, 200);
-                border-bottom: 2px solid #3498db;
-            }
-        """)
         
         # Tab Sniper
         self.sniper_tab = QWidget()
@@ -888,7 +935,7 @@ class Overlay(QWidget):
         # Area scroll per le offerte
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
-        self.scroll.setStyleSheet("background-color: rgba(30,30,30,150); border-radius: 5px;")
+        self.scroll.setStyleSheet("background-color: transparent;")
         
         self.content = QWidget()
         self.vbox = QVBoxLayout()
@@ -923,9 +970,9 @@ class Overlay(QWidget):
 
     def update_button_text(self, index):
         if index == 0:  # Tab Sniper
-            self.new_search_btn.setText("WM Sniper")
+            self.new_search_btn.setText("Create Sniper Watch")
         else:  # Tab Warframe Market
-            self.new_search_btn.setText("WM Market")
+            self.new_search_btn.setText("Search Warframe Market")
 
     # Rendila finestra trascinabile
     def mousePressEvent(self, event):
@@ -1119,12 +1166,13 @@ class OverlaySystem:
     def __init__(self):
         self.app = QApplication(sys.argv)
         
-        # Usa automaticamente l'IP locale come user_id
-        local_ip = get_local_ip()
-        print(f"Using local IP as user ID: {local_ip}")
+        # Il backend accetta esclusivamente UUID nel campo X-User-ID.
+        # Manteniamo lo stesso UUID tra tutte le chiamate e i riavvii dell'overlay.
+        user_id = get_persistent_user_id()
+        print(f"Using persistent user ID: {user_id}")
         
         # Crea l'overlay principale
-        self.overlay = Overlay(local_ip)
+        self.overlay = Overlay(user_id)
         
         # Crea l'icona di toggle
         self.toggle_icon = ToggleIcon(self.overlay)
@@ -1168,3 +1216,4 @@ def run_overlay():
 
 if __name__ == "__main__":
     run_overlay()
+
